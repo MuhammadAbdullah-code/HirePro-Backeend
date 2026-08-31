@@ -225,6 +225,17 @@ class ModerationUpdate(BaseModel):
 
 class VerificationUpdate(BaseModel):
     verified: bool
+    rejection_reason: str | None = Field(default=None, min_length=3, max_length=1000)
+
+    @model_validator(mode="after")
+    def validate_rejection_reason(self) -> "VerificationUpdate":
+        if not self.verified and not (self.rejection_reason or "").strip():
+            raise ValueError("rejection_reason is required when verified is false")
+        if self.verified:
+            self.rejection_reason = None
+        else:
+            self.rejection_reason = self.rejection_reason.strip()
+        return self
 
 
 class HomepageHero(BaseModel):

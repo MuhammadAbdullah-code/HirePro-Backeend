@@ -2,9 +2,12 @@
 
 from datetime import UTC, datetime, timedelta
 from hmac import compare_digest
+from pathlib import Path
 from typing import Annotated, Literal
 
+from cloudinary.utils import cloudinary_url
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import ValidationError
 
@@ -664,12 +667,24 @@ def verification_detail(business_id: str, db: DbSession, _: AdminUser) -> dict:
     documents = []
     for index, value in enumerate((verification or {}).get("required_documents", [])):
         document_value = value if isinstance(value, dict) else {"type": str(value)}
-        file_url = document_value.get("file_url") or document_value.get("url") or ""
+        document_id = str(
+            document_value.get("id")
+            or document_value.get("_id")
+            or document_value.get("upload_id")
+            or f"{business_id}-{index + 1}"
+        )
+        has_file_reference = any(
+            document_value.get(key) for key in ("id", "_id", "upload_id", "file_url", "url")
+        )
         documents.append(
             {
-                "id": str(document_value.get("id") or document_value.get("_id") or f"{business_id}-{index + 1}"),
+                "id": document_id,
                 "type": document_value.get("type") or document_value.get("document_type") or "other",
-                "file_url": file_url,
+                "file_url": (
+                    f"{settings.api_prefix}/admin/verification/{business_id}/documents/{document_id}"
+                    if has_file_reference
+                    else ""
+                ),
                 "file_name": document_value.get("file_name") or document_value.get("name") or "",
                 "status": document_value.get("status") or (verification or {}).get("status", "pending"),
             }
@@ -680,17 +695,84 @@ def verification_detail(business_id: str, db: DbSession, _: AdminUser) -> dict:
         "provider": provider_data,
         "status": (verification or {}).get("status", "not_submitted"),
         "submitted_at": (verification or {}).get("submitted_at"),
+        "reviewed_at": (verification or {}).get("reviewed_at"),
+        "rejection_reason": (verification or {}).get("rejection_reason"),
         "documents": documents,
     }
 
 
+@router.get("/verification/{business_id}/documents/{document_id}", response_model=None)
+def download_verification_document(
+    business_id: str, document_id: str, db: DbSession, _: AdminUser
+) -> FileResponse | RedirectResponse:
+    verification = db.verification_requests.find_one({"business_id": business_id})
+    if verification is None:
+        raise HTTPException(status_code=404, detail="Verification request not found")
+
+    selected = None
+    for value in verification.get("required_documents", []):
+        if not isinstance(value, dict):
+            continue
+        candidate_id = str(value.get("id") or value.get("_id") or value.get("upload_id") or "")
+        if candidate_id == document_id:
+            selected = value
+            break
+    if selected is None:
+        raise HTTPException(status_code=404, detail="Verification document not found")
+
+    upload_id = str(selected.get("upload_id") or selected.get("id") or selected.get("_id") or "")
+    upload = db.uploads.find_one({"_id": upload_id, "user_id": verification.get("provider_id")})
+    if upload:
+        if upload.get("storage_provider") == "cloudinary":
+            url, _ = cloudinary_url(
+                upload["public_id"], resource_type=upload.get("resource_type", "image"), secure=True
+            )
+            return RedirectResponse(url=url, status_code=307)
+        root = Path(settings.upload_directory).resolve()
+        path = (root / upload["stored_name"]).resolve()
+        if root not in path.parents or not path.is_file():
+            raise HTTPException(status_code=404, detail="Verification document file not found")
+        return FileResponse(path, filename=upload.get("original_name") or path.name)
+
+    external_url = str(selected.get("file_url") or selected.get("url") or "")
+    if external_url.startswith("https://"):
+        return RedirectResponse(url=external_url, status_code=307)
+    raise HTTPException(status_code=404, detail="Verification document file not found")
+
+
 @router.patch("/verification/{business_id}", response_model=BusinessOut)
-def verify_business(business_id: str, payload: VerificationUpdate, db: DbSession, _: AdminUser) -> dict:
+def verify_business(business_id: str, payload: VerificationUpdate, db: DbSession, admin: AdminUser) -> dict:
+    now = utc_now()
     item = db.businesses.find_one_and_update(
-        {"_id": business_id}, {"$set": {"is_verified": payload.verified, "updated_at": utc_now()}}, return_document=True
+        {"_id": business_id},
+        {
+            "$set": {
+                "is_verified": payload.verified,
+                "verification_status": "approved" if payload.verified else "rejected",
+                "verification_rejection_reason": payload.rejection_reason,
+                "updated_at": now,
+            }
+        },
+        return_document=True,
     )
     if item is None:
         raise HTTPException(status_code=404, detail="Business not found")
+    verification = db.verification_requests.find_one(
+        {"business_id": business_id}, sort=[("submitted_at", -1), ("created_at", -1)]
+    )
+    if verification:
+        db.verification_requests.update_one(
+            {"_id": verification["_id"]},
+            {
+                "$set": {
+                    "status": "approved" if payload.verified else "rejected",
+                    "rejection_reason": payload.rejection_reason,
+                    "reviewed_at": now,
+                    "reviewed_by": admin["_id"],
+                    "updated_at": now,
+                }
+            },
+        )
     return public(item)
 
 
