@@ -1,0 +1,1 @@
+"""HirePro backend application package."""
